@@ -1,0 +1,52 @@
+[project]
+name = "flepimop2-arviz"
+version = "0.3.0dev"
+description = "An arviz/NetCDF backend provider for flepimop2."
+readme = "README.md"
+license = "GPL-3.0-or-later"
+authors = [
+    { name = "Timothy Willard", email = "twillard@unc.edu" },
+]
+requires-python = ">=3.11,<3.15"
+dependencies = [
+    "flepimop2>=0.3.0,<1.0.0",
+    "arviz>=0.19",
+    "xarray>=2024.9",
+    "netCDF4>=1.7",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering",
+    "Typing :: Typed",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Package everything under `src/flepimop2` as part of the `flepimop2`
+# namespace. The `src/flepimop2`, `src/flepimop2/backend`, and
+# `src/flepimop2/process` directories must remain free of `__init__.py`
+# files so they behave as PEP 420 namespace packages shared with flepimop2
+# core and other provider packages.
+[tool.hatch.build.targets.wheel]
+packages = ["src/flepimop2"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/flepimop2",
+    "LICENSE",
+    "AUTHORS",
+    "README.md",
+    "pyproject.toml",
+]
