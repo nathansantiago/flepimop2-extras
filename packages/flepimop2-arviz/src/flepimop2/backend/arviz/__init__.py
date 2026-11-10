@@ -22,8 +22,9 @@ import re
 import socket
 import subprocess  # noqa: S404
 from datetime import UTC
+from functools import cache
 from pathlib import Path
-from typing import Any, ClassVar, Literal
+from typing import Any, Literal
 
 import numpy as np
 import xarray as xr
@@ -32,11 +33,12 @@ from flepimop2.backend.abc import BackendABC
 from flepimop2.meta import RunMeta
 from flepimop2.parameter.abc import ModelStateSpecification
 from flepimop2.typing import Array, Float64NDArray
-from pydantic import Field
+from pydantic import Field, PrivateAttr
 
 _SEED_SUFFIX = re.compile(r"_seed(\d+)$")
 
 
+@cache
 def _git_commit() -> str | None:
     """
     Best-effort current git commit SHA for the working directory.
@@ -156,19 +158,40 @@ class ArvizBackend(BackendABC, module="arviz"):
     chain_env: str = "FLEPIMOP2_CHAIN"
     draw_env: str = "FLEPIMOP2_DRAW"
 
-    _did_overwrite: ClassVar[set[Path]] = set()
+    _did_overwrite: bool = PrivateAttr(default=False)
 
-    def _shard_dir(self) -> Path:
-        return self.root / f"{self.name}_shards"
+    def _name_for(self, run_meta: RunMeta | None = None) -> str:
+        """Return `run_meta.name` when provided, else `self.name`.
 
-    def _combined_path(self) -> Path:
-        return self.root / f"{self.name}.nc"
+        Used to derive both the shard directory and the combined file path,
+        so `save()` and `read()` agree on the output location for a given
+        `RunMeta`.
+        """
+        if run_meta is not None and run_meta.name:
+            return run_meta.name
+        return self.name
+
+    def _shard_dir(self, run_meta: RunMeta | None = None) -> Path:
+        return self.root / f"{self._name_for(run_meta)}_shards"
+
+    def _combined_path(self, run_meta: RunMeta | None = None) -> Path:
+        return self.root / f"{self._name_for(run_meta)}.nc"
 
     def _chain_index(self) -> int:
         return int(os.environ.get(self.chain_env, "0"))
 
     def _draw_index(self, shard_dir: Path, chain_idx: int) -> int:
+        env_chain = os.environ.get(self.chain_env)
         env_draw = os.environ.get(self.draw_env)
+        if env_chain is not None and env_draw is None:
+            msg = (
+                f"{self.chain_env} is set but {self.draw_env} is not; "
+                "both must be set together to avoid silent collisions in "
+                "parallel/HPC runs (e.g. a Slurm job array). Export "
+                f"{self.draw_env} alongside {self.chain_env}, or unset "
+                "both to use the local shard-count fallback."
+            )
+            raise RuntimeError(msg)
         if env_draw is not None:
             return int(env_draw)
         if not shard_dir.is_dir():
@@ -215,12 +238,12 @@ class ArvizBackend(BackendABC, module="arviz"):
             raise ValueError(msg)
         resolved_axes = axes if axes is not None else AxisCollection()
 
-        shard_dir = self._shard_dir()
-        if self.mode == "overwrite" and shard_dir not in self._did_overwrite:
+        shard_dir = self._shard_dir(run_meta)
+        if self.mode == "overwrite" and not self._did_overwrite:
             if shard_dir.is_dir():
                 for shard in shard_dir.glob("*.nc"):
                     shard.unlink()
-            self._did_overwrite.add(shard_dir)
+            self._did_overwrite = True
         shard_dir.mkdir(parents=True, exist_ok=True)
 
         chain_idx = self._chain_index()
@@ -246,34 +269,77 @@ class ArvizBackend(BackendABC, module="arviz"):
         encoding = {var: {"zlib": True, "complevel": 4} for var in ds.data_vars}
         ds.to_netcdf(shard_path, group=self.group, mode="w", encoding=encoding)
 
-    def _read(self, run_meta: RunMeta) -> Float64NDArray:  # noqa: ARG002
+    def _read(self, run_meta: RunMeta) -> Float64NDArray:
         """
-        Read the combined NetCDF file produced by `arviz_combine`.
+        Read one draw back as the `(T, 1 + n_state)` engine array.
+
+        Resolves the same `(chain, draw)` indices `_save()` uses from the
+        `FLEPIMOP2_CHAIN`/`FLEPIMOP2_DRAW` env vars. Prefers the per-draw
+        shard at `<shard_dir>/draw_<chain>_<draw>.nc` (O(1); does not
+        require `arviz_combine` to have run). Falls back to the combined
+        file at `<root>/<name>.nc`, `isel`-ing the matching chain/draw.
+
+        Args:
+            run_meta: Metadata about the current run; its `name` overrides
+                `self.name` for both the shard directory and the combined
+                file path when provided.
 
         Returns:
-            Every data variable stacked into a single 2D array.
+            `(T, 1 + n_state)` float64 array: column 0 is the `time`
+            coordinate, remaining columns are each data variable's values
+            flattened across its non-`(chain, draw, time)` dimensions,
+            concatenated in `data_vars` insertion order.
 
         Raises:
-            FileNotFoundError: If the combined file doesn't exist yet. Shards
-                written by `save()` must be consolidated with the
-                `arviz_combine` process step first.
+            FileNotFoundError: If neither the per-draw shard nor the
+                combined file exists.
         """
-        combined_path = self._combined_path()
-        if not combined_path.exists():
-            msg = (
-                f"No combined file at {combined_path}. Run the "
-                "'arviz_combine' process step to consolidate shards from "
-                f"{self._shard_dir()} first."
-            )
-            raise FileNotFoundError(msg)
-        with xr.open_dataset(combined_path, group=self.group) as ds:
-            return np.concatenate(
-                [
-                    np.asarray(ds[v].values).reshape(ds.sizes["draw"], -1)
-                    for v in ds.data_vars
-                ],
-                axis=1,
-            ).astype(np.float64)
+        chain_idx = self._chain_index()
+        shard_dir = self._shard_dir(run_meta)
+        draw_idx = self._draw_index(shard_dir, chain_idx)
+
+        shard_path = shard_dir / f"draw_{chain_idx:04d}_{draw_idx:04d}.nc"
+        if shard_path.exists():
+            with xr.open_dataset(shard_path, group=self.group) as ds:
+                return self._dataset_to_engine_array(ds.isel(chain=0, draw=0))
+
+        combined_path = self._combined_path(run_meta)
+        if combined_path.exists():
+            with xr.open_dataset(combined_path, group=self.group) as ds:
+                return self._dataset_to_engine_array(
+                    ds.isel(chain=chain_idx, draw=draw_idx)
+                )
+
+        msg = (
+            f"No data for chain={chain_idx}, draw={draw_idx}: neither the "
+            f"per-draw shard at {shard_path} nor the combined file at "
+            f"{combined_path} exists. Run `save()` to write a shard, or run "
+            "the 'arviz_combine' process step to consolidate shards into "
+            "the combined file."
+        )
+        raise FileNotFoundError(msg)
+
+    @staticmethod
+    def _dataset_to_engine_array(ds: xr.Dataset) -> Float64NDArray:
+        """
+        Reshape a per-draw labelled dataset back to `(T, 1 + n_state)`.
+
+        Args:
+            ds: Dataset with a `time` coord and one data variable per
+                parameter name, each with dims `(time, *axes)`.
+
+        Returns:
+            Float64 array: column 0 is `time`, remaining columns are each
+            variable's values flattened across its non-`time` dims,
+            concatenated in `data_vars` insertion order.
+        """
+        time_col = np.asarray(ds["time"].values, dtype=np.float64).reshape(-1, 1)
+        t_size = time_col.shape[0]
+        blocks: list[Float64NDArray] = [time_col]
+        for name in ds.data_vars:
+            values = np.asarray(ds[name].values, dtype=np.float64)
+            blocks.append(values.reshape(t_size, -1))
+        return np.concatenate(blocks, axis=1)
 
     @staticmethod
     def _variable(

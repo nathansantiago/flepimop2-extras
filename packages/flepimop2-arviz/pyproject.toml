@@ -11,6 +11,7 @@ requires-python = ">=3.11,<3.15"
 dependencies = [
     "flepimop2>=0.3.0,<1.0.0",
     "arviz>=0.19",
+    "dask[array]>=2024.1",
     "xarray>=2024.9",
     "netCDF4>=1.7",
 ]

@@ -33,7 +33,9 @@ def _write_shards(root: Path, n_draws: int) -> None:
     model_state = ModelStateSpecification(parameter_names=("s0", "i0"))
     for draw in range(n_draws):
         data = np.array([[0.0, float(draw), float(draw) + 1.0]])
-        backend.save(data, RunMeta(name=f"draw_{draw}"), model_state=model_state)
+        # Use the default `self.name` (no run-level name override) so every
+        # shard lands in the same `trace_shards` directory.
+        backend.save(data, RunMeta(), model_state=model_state)
 
 
 def test_combine_concatenates_shards_along_draw(tmp_path: Path) -> None:
@@ -82,9 +84,7 @@ def test_new_shard_invalidates_satisfaction(tmp_path: Path) -> None:
     time.sleep(0.05)
     backend = ArvizBackend(root=tmp_path)
     model_state = ModelStateSpecification(parameter_names=("s0", "i0"))
-    backend.save(
-        np.array([[0.0, 9.0, 9.0]]), RunMeta(name="late_draw"), model_state=model_state
-    )
+    backend.save(np.array([[0.0, 9.0, 9.0]]), RunMeta(), model_state=model_state)
 
     assert process.is_satisfied() is False
 

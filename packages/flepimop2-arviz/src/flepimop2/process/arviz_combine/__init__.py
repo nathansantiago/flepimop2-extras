@@ -17,6 +17,7 @@
 
 __all__ = ["ArvizCombineProcess"]
 
+import contextlib
 from pathlib import Path
 from typing import Literal
 
@@ -99,6 +100,12 @@ class ArvizCombineProcess(ProcessABC, module="arviz_combine"):
         """
         Concatenate every shard along `draw` and write `target` in one pass.
 
+        Streams shards from disk rather than materializing every one into
+        memory at once: tries `open_mfdataset` first (xarray streams the
+        concat), falling back to a per-shard `open_dataset` `concat` on
+        structural issues (e.g. conflicting non-`draw` coords). Every file
+        handle is closed deterministically via `with` blocks.
+
         Args:
             dry_run: If `True`, report the plan without writing anything.
 
@@ -116,11 +123,36 @@ class ArvizCombineProcess(ProcessABC, module="arviz_combine"):
             return
 
         self.target.parent.mkdir(parents=True, exist_ok=True)
-        datasets = [xr.open_dataset(shard, group=self.group).load() for shard in shards]
         try:
+            with xr.open_mfdataset(
+                shards,
+                group=self.group,
+                combine="nested",
+                concat_dim="draw",
+            ) as raw:
+                combined = raw.sortby("draw")
+                encoding = {
+                    var: {"zlib": True, "complevel": 4} for var in combined.data_vars
+                }
+                combined.to_netcdf(
+                    self.target, group=self.group, mode="w", encoding=encoding
+                )
+                return
+        except (ValueError, OSError, ImportError, xr.MergeError):
+            # Structural issue (coord conflict, dim mismatch, etc.) or
+            # missing optional dependency (dask) — fall through to the
+            # per-shard path that opens one file at a time.
+            pass
+
+        with contextlib.ExitStack() as stack:
+            datasets = [
+                stack.enter_context(xr.open_dataset(shard, group=self.group))
+                for shard in shards
+            ]
             combined = xr.concat(datasets, dim="draw", data_vars="all").sortby("draw")
-        finally:
-            for ds in datasets:
-                ds.close()
-        encoding = {var: {"zlib": True, "complevel": 4} for var in combined.data_vars}
-        combined.to_netcdf(self.target, group=self.group, mode="w", encoding=encoding)
+            encoding = {
+                var: {"zlib": True, "complevel": 4} for var in combined.data_vars
+            }
+            combined.to_netcdf(
+                self.target, group=self.group, mode="w", encoding=encoding
+            )
